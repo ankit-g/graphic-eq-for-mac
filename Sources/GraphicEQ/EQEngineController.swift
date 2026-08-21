@@ -3,6 +3,7 @@ import AVFoundation
 import AudioToolbox
 import CoreAudio
 import Combine
+import os.log
 
 enum EQEngineError: LocalizedError {
     case blackHoleNotFound
@@ -23,13 +24,21 @@ enum EQEngineError: LocalizedError {
 
 /// Owns the two AVAudioEngines that bridge system audio (via BlackHole) through a graphic
 /// EQ and out to the user's chosen physical output device. See RingBuffer for the bridge.
+///
+/// Both engines are created ONCE and kept alive for the app's lifetime; enable/disable only
+/// stops/reconfigures/restarts them. Recreating a fresh AVAudioEngine on every enable was
+/// tried first and is flaky: CoreAudio doesn't always release a HAL device binding from a
+/// just-stopped engine instance before a second, brand-new engine tries to claim the same
+/// device, so the second enable "succeeds" with no error but produces no audio.
 final class EQEngineController {
+    private static let log = OSLog(subsystem: "com.ankitgupta.graphiceq", category: "engine")
+
     private let appState: AppState
 
-    private var engineA: AVAudioEngine?
-    private var engineB: AVAudioEngine?
-    private var playerNode: AVAudioPlayerNode?
-    private var eqNode: AVAudioUnitEQ?
+    private let engineA = AVAudioEngine()
+    private let engineB = AVAudioEngine()
+    private let playerNode = AVAudioPlayerNode()
+    private let eqNode: AVAudioUnitEQ
 
     private var converter: AVAudioConverter?
     private let ringBuffer: RingBuffer
@@ -54,7 +63,15 @@ final class EQEngineController {
 
     init(appState: AppState) {
         self.appState = appState
+        self.eqNode = AVAudioUnitEQ(numberOfBands: EQBands.count)
         self.ringBuffer = RingBuffer(capacityFrames: Self.ringCapacityFrames, channelCount: Int(Self.bridgeChannelCount))
+
+        configureEQBands(gains: appState.bandGains)
+        engineB.attach(playerNode)
+        engineB.attach(eqNode)
+        engineB.connect(playerNode, to: eqNode, format: bridgeFormat)
+        engineB.connect(eqNode, to: engineB.mainMixerNode, format: bridgeFormat)
+
         observeAppState()
     }
 
@@ -97,6 +114,7 @@ final class EQEngineController {
             try enableEQMode(realOutputDeviceID: device.id)
             appState.statusMessage = "Enabled — routing via BlackHole"
         } catch {
+            os_log("enableEQMode failed: %{public}@", log: Self.log, type: .error, String(describing: error))
             appState.statusMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             appState.isEnabled = false
         }
@@ -110,42 +128,49 @@ final class EQEngineController {
         }
 
         savedOriginalOutputDeviceID = AudioDeviceManager.getDefaultOutputDevice()
+        os_log("enable: saved original output = %u", log: Self.log, type: .info, savedOriginalOutputDeviceID ?? 0)
 
         guard AudioDeviceManager.setDefaultOutputDevice(blackHole.id) else {
             throw EQEngineError.deviceBindingFailed("could not set default output to BlackHole")
         }
 
+        ringBuffer.reset()
         try startEngineA(blackHoleDeviceID: blackHole.id)
         try startEngineB(realOutputDeviceID: realOutputDeviceID)
         startDrainTimer()
+        os_log("enable: engines running (A=%{public}@ B=%{public}@)", log: Self.log, type: .info,
+               String(engineA.isRunning), String(engineB.isRunning))
     }
 
     func disableEQMode() {
         stopDrainTimer()
 
-        engineA?.inputNode.removeTap(onBus: 0)
-        engineA?.stop()
-        engineA = nil
-
-        playerNode?.stop()
-        engineB?.stop()
-        engineB = nil
-        playerNode = nil
-        eqNode = nil
+        if engineA.isRunning {
+            engineA.inputNode.removeTap(onBus: 0)
+            engineA.stop()
+        }
+        if engineB.isRunning {
+            playerNode.stop()
+            engineB.stop()
+        }
         converter = nil
 
         if let original = savedOriginalOutputDeviceID {
             AudioDeviceManager.setDefaultOutputDevice(original)
         }
         savedOriginalOutputDeviceID = nil
+        os_log("disable: engines stopped, output restored", log: Self.log, type: .info)
     }
 
     // MARK: - Engine A (capture from BlackHole)
 
     private func startEngineA(blackHoleDeviceID: AudioDeviceID) throws {
-        let engine = AVAudioEngine()
-        let input = engine.inputNode
+        if engineA.isRunning {
+            engineA.inputNode.removeTap(onBus: 0)
+            engineA.stop()
+        }
 
+        let input = engineA.inputNode
         try setCurrentDevice(blackHoleDeviceID, on: input.audioUnit)
 
         let inputFormat = input.inputFormat(forBus: 0)
@@ -155,16 +180,15 @@ final class EQEngineController {
 
         converter = AVAudioConverter(from: inputFormat, to: bridgeFormat)
 
-        engine.connect(input, to: engine.mainMixerNode, format: inputFormat)
-        engine.mainMixerNode.outputVolume = 0
+        engineA.connect(input, to: engineA.mainMixerNode, format: inputFormat)
+        engineA.mainMixerNode.outputVolume = 0
 
         input.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
             self?.handleCapturedBuffer(buffer)
         }
 
-        engine.prepare()
-        try engine.start()
-        engineA = engine
+        engineA.prepare()
+        try engineA.start()
     }
 
     private func handleCapturedBuffer(_ buffer: AVAudioPCMBuffer) {
@@ -208,57 +232,48 @@ final class EQEngineController {
     // MARK: - Engine B (EQ + playback to real device)
 
     private func startEngineB(realOutputDeviceID: AudioDeviceID) throws {
-        let engine = AVAudioEngine()
-        let player = AVAudioPlayerNode()
-        let eq = makeEQNode()
+        if engineB.isRunning {
+            playerNode.stop()
+            engineB.stop()
+        }
 
-        engine.attach(player)
-        engine.attach(eq)
-        engine.connect(player, to: eq, format: bridgeFormat)
-        engine.connect(eq, to: engine.mainMixerNode, format: bridgeFormat)
+        try setCurrentDevice(realOutputDeviceID, on: engineB.outputNode.audioUnit)
 
-        try setCurrentDevice(realOutputDeviceID, on: engine.outputNode.audioUnit)
-
-        engine.prepare()
-        try engine.start()
-        player.play()
-
-        engineB = engine
-        playerNode = player
-        eqNode = eq
+        engineB.prepare()
+        try engineB.start()
+        playerNode.play()
         applyGains(appState.bandGains)
     }
 
     private func switchRealOutputDevice(to deviceID: AudioDeviceID) {
-        guard let engine = engineB, let player = playerNode else { return }
-        player.stop()
-        engine.stop()
+        guard engineB.isRunning else { return }
+        playerNode.stop()
+        engineB.stop()
         do {
-            try setCurrentDevice(deviceID, on: engine.outputNode.audioUnit)
-            engine.prepare()
-            try engine.start()
-            player.play()
+            try setCurrentDevice(deviceID, on: engineB.outputNode.audioUnit)
+            engineB.prepare()
+            try engineB.start()
+            playerNode.play()
         } catch {
+            os_log("switchRealOutputDevice failed: %{public}@", log: Self.log, type: .error, String(describing: error))
             appState.statusMessage = "Failed to switch output device: \(error.localizedDescription)"
         }
     }
 
-    private func makeEQNode() -> AVAudioUnitEQ {
-        let eq = AVAudioUnitEQ(numberOfBands: EQBands.count)
+    private func configureEQBands(gains: [Float]) {
         for (index, definition) in EQBands.definitions.enumerated() {
-            let band = eq.bands[index]
+            let band = eqNode.bands[index]
             band.filterType = .parametric
             band.frequency = Float(definition.frequency)
             band.bandwidth = EQBands.bandwidth
-            band.gain = appState.bandGains[index]
+            band.gain = gains[index]
             band.bypass = false
         }
-        eq.globalGain = 0
-        return eq
+        eqNode.globalGain = 0
     }
 
     private func applyGains(_ gains: [Float]) {
-        guard let eqNode, gains.count == eqNode.bands.count else { return }
+        guard gains.count == eqNode.bands.count else { return }
         for (index, gain) in gains.enumerated() {
             eqNode.bands[index].gain = gain
         }
@@ -282,7 +297,7 @@ final class EQEngineController {
     }
 
     private func drainRingBufferToPlayer() {
-        guard let player = playerNode else { return }
+        guard engineB.isRunning else { return }
         let channels = Int(bridgeFormat.channelCount)
         let frameCount = Self.drainFrameCount
         guard let buffer = AVAudioPCMBuffer(pcmFormat: bridgeFormat, frameCapacity: AVAudioFrameCount(frameCount)) else { return }
@@ -301,7 +316,7 @@ final class EQEngineController {
             }
         }
 
-        player.scheduleBuffer(buffer, completionHandler: nil)
+        playerNode.scheduleBuffer(buffer, completionHandler: nil)
     }
 
     // MARK: - Device binding helper

@@ -3,3 +3,4 @@
 GraphicEQ.app/
 *.xcodeproj
 .DS_Store
+.claude/

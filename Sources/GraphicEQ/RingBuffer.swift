@@ -29,6 +29,14 @@ final class RingBuffer {
         return availableFramesCount
     }
 
+    /// Clears all buffered audio and resets indices. Call when starting a fresh session
+    /// (e.g. re-enabling after a disable) so stale samples from a prior session aren't played.
+    func reset() {
+        lock.lock(); defer { lock.unlock() }
+        writeIndex = 0
+        availableFramesCount = 0
+    }
+
     private var readIndexFrame: Int {
         let idx = writeIndex - availableFramesCount
         return ((idx % capacityFrames) + capacityFrames) % capacityFrames
