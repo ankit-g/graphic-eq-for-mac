@@ -5,6 +5,16 @@ final class AppState: ObservableObject {
     private enum Keys {
         static let bandGains = "bandGains"
         static let selectedOutputDeviceUID = "selectedOutputDeviceUID"
+        static let originalOutputDeviceUID = "originalOutputDeviceUID"
+    }
+
+    /// UID of the device that was the system default before we hijacked it, persisted so an
+    /// unclean exit (crash, force-quit, logout) can still be recovered from on next launch.
+    /// Deliberately not @Published: nothing in the UI shows it, and republishing it during
+    /// enable/disable would add another reentrancy hazard to the state machine.
+    var originalOutputDeviceUID: String? {
+        get { UserDefaults.standard.string(forKey: Keys.originalOutputDeviceUID) }
+        set { UserDefaults.standard.set(newValue, forKey: Keys.originalOutputDeviceUID) }
     }
 
     @Published var isEnabled: Bool = false

@@ -68,9 +68,30 @@ to-have. `AppDelegate.applicationWillTerminate` and a `SIGTERM` handler are both
 same restore path (`disableEQMode()`) as a safety net — a force-quit or logout doesn't always
 route through the normal termination callback.
 
-## Known open issue
+Three invariants keep that restore path honest — don't break them:
 
-Re-enabling EQ after disabling it does not currently work reliably — this is under active
-investigation. If you're touching `enableEQMode`/`disableEQMode`/`startEngineA`/
-`startEngineB`, be aware the persistent-engine refactor (see git history) was meant to fix
-this but hasn't been fully verified yet.
+1. **Never save BlackHole as the device to restore to.** `captureOriginalOutputDevice` falls
+   back to the user's selected device when BlackHole is already the default. Saving BlackHole
+   makes restore a permanent no-op: every later disable/quit "restores" to a silent virtual
+   device, and the user has no in-app way out.
+2. **`enableEQMode` is guarded by `isActive`.** Enabling twice without an intervening disable
+   is what re-captures BlackHole as the original in the first place.
+3. **The restore target is persisted as a UID, not an `AudioDeviceID`.** IDs get recycled
+   across unplug/replug. It's written to `UserDefaults` so `recoverFromUncleanShutdown()` can
+   un-strand the user at next launch after a crash or force-quit.
+
+Also: `AVAudioEngine`'s `inputNode.audioUnit` and `outputNode.audioUnit` are the *same* AU
+instance, so pinning engine A's input to BlackHole pins its output there too. Engine A's
+mixer is muted (`outputVolume = 0`) purely to stop that from becoming a BlackHole→BlackHole
+feedback loop.
+
+## Known open issues
+
+- No `AVAudioEngineConfigurationChangeNotification` observer. When it fires (device
+  hot-plug, format change) the engine stops itself, audio dies silently, and the UI still
+  shows enabled. `switchRealOutputDevice` also doesn't reconnect `mainMixerNode ->
+  outputNode` after a device change, so that connection keeps its original format.
+- The drain timer schedules into `playerNode` with no back-pressure (`nil` completion
+  handler), so there's no feedback path to correct wall-clock-vs-audio-clock drift.
+- The capture path is not real-time safe: it allocates per callback and `RingBuffer` uses
+  an `NSLock`. `converter` is also written on main and read from the tap thread unsynchronized.
