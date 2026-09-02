@@ -188,22 +188,27 @@ final class EQEngineController {
     /// default output is still BlackHole and the user has no audio. Put it back at launch.
     private func recoverFromUncleanShutdown() {
         guard let uid = appState.originalOutputDeviceUID else { return }
-        defer { appState.originalOutputDeviceUID = nil }
 
         guard let blackHole = AudioDeviceManager.findBlackHoleDevice(),
               AudioDeviceManager.getDefaultOutputDevice() == blackHole.id else {
             // Default output isn't BlackHole, so someone (the user, or a clean exit we didn't
             // record) already sorted it out. Don't yank them off their current device.
+            clearSavedOutputDevice()
             return
         }
-        guard let device = AudioDeviceManager.device(forUID: uid) else {
-            os_log("recovery: saved device %{public}@ is gone, leaving default alone",
-                   log: Self.log, type: .error, uid)
+
+        // Same reasoning as restoreOriginalOutputDevice: the saved device may well be gone by
+        // now (that is often *why* the last run failed to restore), and any live device beats
+        // booting the user into silence a second time.
+        guard let device = moveDefaultOutput(preferring: uid) else {
+            os_log("recovery: stranded on BlackHole and no output device would take the default",
+                   log: Self.log, type: .error)
+            appState.statusMessage = "Audio output is stuck on BlackHole — pick a device in System Settings."
             return
         }
-        let ok = AudioDeviceManager.setDefaultOutputDevice(device.id)
-        os_log("recovery: previous run exited without restoring; default output -> %{public}@ (ok=%{public}@)",
-               log: Self.log, type: .info, device.name, String(ok))
+        os_log("recovery: previous run exited without restoring; default output -> %{public}@ (wanted %{public}@)",
+               log: Self.log, type: .info, device.name, uid)
+        clearSavedOutputDevice()
     }
 
     private func observeAppState() {
@@ -336,28 +341,69 @@ final class EQEngineController {
         restoreOriginalOutputDevice()
     }
 
+    /// Ordered restore targets: the device we took over, then the one selected in the UI, then
+    /// any real output device. BlackHole is never a candidate — restoring *to* it is the same
+    /// as not restoring at all.
+    private func restoreCandidates(preferring uid: String?) -> [AudioDeviceInfo] {
+        let blackHoleID = AudioDeviceManager.findBlackHoleDevice()?.id
+        let preferred = [uid, appState.selectedOutputDeviceUID]
+            .compactMap { $0 }
+            .compactMap { AudioDeviceManager.device(forUID: $0) }
+
+        var seen = Set<AudioDeviceID>()
+        return (preferred + AudioDeviceManager.outputCapableDevices()).filter { device in
+            device.id != blackHoleID && seen.insert(device.id).inserted
+        }
+    }
+
+    /// Moves the system default output to the first candidate that accepts it. Returns the
+    /// device that took, or nil if every one of them refused.
+    private func moveDefaultOutput(preferring uid: String?) -> AudioDeviceInfo? {
+        restoreCandidates(preferring: uid).first { AudioDeviceManager.setDefaultOutputDevice($0.id) }
+    }
+
+    /// Puts the system default output back on something audible.
+    ///
+    /// The saved device is only the *first* choice. If it is gone — headphones unplugged while
+    /// the EQ was running, which is exactly how a user gets stranded — falling through to the
+    /// UI-selected device and then to any real output device is strictly better than giving up,
+    /// because giving up leaves the default on BlackHole: total system silence, with no in-app
+    /// affordance to escape it.
     private func restoreOriginalOutputDevice() {
-        guard let uid = savedOriginalOutputDeviceUID ?? appState.originalOutputDeviceUID else {
-            os_log("disable: engines stopped, no saved device to restore", log: Self.log, type: .info)
+        let savedUID = savedOriginalOutputDeviceUID ?? appState.originalOutputDeviceUID
+        let blackHoleID = AudioDeviceManager.findBlackHoleDevice()?.id
+        let strandedOnBlackHole = blackHoleID != nil
+            && AudioDeviceManager.getDefaultOutputDevice() == blackHoleID
+
+        guard savedUID != nil || strandedOnBlackHole else {
+            os_log("disable: engines stopped, default output is already a real device",
+                   log: Self.log, type: .info)
+            clearSavedOutputDevice()
             return
         }
-        defer {
-            savedOriginalOutputDeviceUID = nil
-            appState.originalOutputDeviceUID = nil
-        }
-        guard let device = AudioDeviceManager.device(forUID: uid) else {
-            os_log("disable: saved device %{public}@ no longer present, cannot restore",
-                   log: Self.log, type: .error, uid)
-            appState.statusMessage = "Original output device is gone — pick one in System Settings."
+
+        guard let device = moveDefaultOutput(preferring: savedUID) else {
+            // Every candidate refused. Deliberately keep the saved UID on disk: it is the
+            // breadcrumb recoverFromUncleanShutdown() needs to try again at next launch.
+            os_log("disable: could not move default output off BlackHole", log: Self.log, type: .error)
+            appState.statusMessage = "Could not restore audio output — pick a device in System Settings."
             return
         }
-        if AudioDeviceManager.setDefaultOutputDevice(device.id) {
+
+        if device.uid == savedUID {
             os_log("disable: engines stopped, output restored to %{public}@",
                    log: Self.log, type: .info, device.name)
         } else {
-            os_log("disable: FAILED to restore output to %{public}@", log: Self.log, type: .error, device.name)
-            appState.statusMessage = "Could not restore \(device.name) — set it in System Settings."
+            os_log("disable: saved device %{public}@ unavailable, output fell back to %{public}@",
+                   log: Self.log, type: .info, savedUID ?? "(none)", device.name)
+            appState.statusMessage = "Previous output device is gone — switched to \(device.name)."
         }
+        clearSavedOutputDevice()
+    }
+
+    private func clearSavedOutputDevice() {
+        savedOriginalOutputDeviceUID = nil
+        appState.originalOutputDeviceUID = nil
     }
 
     private func removeCaptureTap() {

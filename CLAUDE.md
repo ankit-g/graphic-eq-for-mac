@@ -79,6 +79,12 @@ Three invariants keep that restore path honest — don't break them:
 3. **The restore target is persisted as a UID, not an `AudioDeviceID`.** IDs get recycled
    across unplug/replug. It's written to `UserDefaults` so `recoverFromUncleanShutdown()` can
    un-strand the user at next launch after a crash or force-quit.
+4. **Restore never gives up while the default is still BlackHole.** The saved device is only
+   the first candidate; if it's gone (headphones unplugged mid-session — the common case)
+   `restoreCandidates` falls through to the UI-selected device and then to any real output
+   device. Bailing out instead leaves the machine silent with no in-app way out. Corollary:
+   only clear the persisted UID once the default is actually off BlackHole — clearing it on a
+   failed restore destroys the breadcrumb `recoverFromUncleanShutdown()` needs next launch.
 
 Also: `AVAudioEngine`'s `inputNode.audioUnit` and `outputNode.audioUnit` are the *same* AU
 instance, so pinning engine A's input to BlackHole pins its output there too. Engine A's
